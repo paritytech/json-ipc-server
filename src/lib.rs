@@ -37,6 +37,7 @@ use std::sync::*;
 use std::sync::atomic::*;
 
 const SERVER: Token = Token(0);
+const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
 struct SocketConnection {
     socket: UnixStream,
@@ -115,6 +116,7 @@ pub struct Server {
     event_loop: Arc<RwLock<EventLoop<RpcServer>>>,
     is_stopping: Arc<AtomicBool>,
     is_stopped: Arc<AtomicBool>,
+    addr: String,
 }
 
 #[derive(Debug)]
@@ -141,6 +143,7 @@ impl Server {
             event_loop: Arc::new(RwLock::new(event_loop)),
             is_stopping: Arc::new(AtomicBool::new(false)),
             is_stopped: Arc::new(AtomicBool::new(true)),
+            addr: socket_addr.to_owned(),
         })
     }
 
@@ -188,6 +191,21 @@ impl Server {
         Ok(())
     }
 
+    pub fn stop(&self) -> Result<(), Error> {
+        if self.is_stopped.load(Ordering::Relaxed) { return Err(Error::NotStarted) }
+        if self.is_stopping.load(Ordering::Relaxed) { return Err(Error::AlreadyStopping)}
+        self.is_stopping.store(true, Ordering::Relaxed);
+        while !self.is_stopped.load(Ordering::Relaxed) { std::thread::sleep(std::time::Duration::new(0, 10)); }
+        Ok(())
+    }
+}
+
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop().unwrap_or_else(|_| {}); // ignore error - can be stopped already
+        ::std::fs::remove_file(&self.addr).unwrap_or_else(|_| {}); // ignoer error - server could have never been started
+    }
 }
 
 impl RpcServer {
@@ -197,10 +215,10 @@ impl RpcServer {
         let mut event_loop = try!(EventLoop::new());
         ::std::fs::remove_file(addr).unwrap_or_else(|_| {} ); // ignore error (if no file)
         let socket = try!(UnixListener::bind(&addr));
-        event_loop.register(&socket, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+        event_loop.register(&socket, SERVER, EventSet::readable(), PollOpt::edge()).unwrap();
         let server = RpcServer {
             socket: socket,
-            connections: Slab::new_starting_at(Token(1), 8),
+            connections: Slab::new_starting_at(Token(1), MAX_CONCURRENT_CONNECTIONS),
             io_handler: io_handler.clone(),
         };
         Ok((server, event_loop))
@@ -209,7 +227,13 @@ impl RpcServer {
     fn accept(&mut self, event_loop: &mut EventLoop<RpcServer>) -> io::Result<()> {
         let new_client_socket = self.socket.accept().unwrap().unwrap();
         let connection = SocketConnection::new(new_client_socket);
-        let token = self.connections.insert(connection).ok().expect("fatal: Could not add connectiont o slab (memory issue?)");
+        if self.connections.count() >= MAX_CONCURRENT_CONNECTIONS {
+            let oldest_token = self.connections.iter().nth(0)
+                .expect("fatal: impossible since count > MAX_CONCURRENT_CONNECTIONS and we request first one")
+                .token.unwrap().clone();
+            self.connections.remove(oldest_token);
+        }
+        let token = self.connections.insert(connection).ok().expect("fatal: Could not add connection to slab (memory issue?)");
 
         self.connections[token].token = Some(token);
         event_loop.register(
@@ -217,7 +241,7 @@ impl RpcServer {
             token,
             EventSet::readable(),
             PollOpt::edge() | PollOpt::oneshot()
-        ).ok().expect("could not register socket with event loop (memory issue?)");
+        ).ok().expect("fatal: could not register socket with event loop (memory issue?)");
 
         Ok(())
     }
@@ -236,6 +260,7 @@ impl RpcServer {
         &mut self.connections[tok]
     }
 }
+
 
 impl Handler for RpcServer {
     type Timeout = usize;
@@ -282,8 +307,10 @@ fn dummy_io_handler() -> Arc<IoHandler> {
 
     struct SayHello;
     impl MethodCommand for SayHello {
-        fn execute(&self, _params: Params) -> Result<Value, Error> {
-            Ok(Value::String("hello".to_string()))
+        fn execute(&self, params: Params) -> Result<Value, Error> {
+            let (request_p1, request_p2) = from_params::<(u64, u64)>(params).unwrap();
+            let response_str = format!("hello {}! you sent {}", request_p1, request_p2);
+            Ok(Value::String(response_str))
         }
     }
 
@@ -302,13 +329,71 @@ pub fn test_reqrep() {
     });
 
     let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [42, 23], "id": 1}"#;
-    let response = r#"{"jsonrpc":"2.0","result":"hello","id":1}"#;
+    let response = r#"{"jsonrpc":"2.0","result":"hello 42! you sent 23","id":1}"#;
 
     assert_eq!(String::from_utf8(dummy_request(addr, request.as_bytes())).unwrap(), response.to_string());
 }
+
+#[test]
+pub fn test_reqrep_two_sequental_connections() {
+    let addr = "/tmp/test15";
+    let io = dummy_io_handler();
+    let server = Server::new(addr, &io).unwrap();
+    std::thread::spawn(move || {
+        server.run()
+    });
+
+    let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [42, 23], "id": 1}"#;
+    let response = r#"{"jsonrpc":"2.0","result":"hello 42! you sent 23","id":1}"#;
+    assert_eq!(String::from_utf8(dummy_request(addr, request.as_bytes())).unwrap(), response.to_string());
+
+    let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [555, 666], "id": 1}"#;
+    let response = r#"{"jsonrpc":"2.0","result":"hello 555! you sent 666","id":1}"#;
+    assert_eq!(String::from_utf8(dummy_request(addr, request.as_bytes())).unwrap(), response.to_string());
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+#[test]
+pub fn test_reqrep_three_sequental_connections() {
+    let addr = "/tmp/test25";
+    let io = dummy_io_handler();
+    let server = Server::new(addr, &io).unwrap();
+    std::thread::spawn(move || {
+        server.run()
+    });
+
+    let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [42, 23], "id": 1}"#;
+    let response = r#"{"jsonrpc":"2.0","result":"hello 42! you sent 23","id":1}"#;
+    assert_eq!(String::from_utf8(dummy_request(addr, request.as_bytes())).unwrap(), response.to_string());
+
+    let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [555, 666], "id": 1}"#;
+    String::from_utf8(dummy_request(addr, request.as_bytes())).unwrap();
+
+    let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [9999, 1111], "id": 1}"#;
+    let response = r#"{"jsonrpc":"2.0","result":"hello 9999! you sent 1111","id":1}"#;
+    assert_eq!(String::from_utf8(dummy_request(addr, request.as_bytes())).unwrap(), response.to_string());
+}
+
+#[test]
+pub fn test_reqrep_100_connections() {
+    let addr = "/tmp/test45";
+    let io = dummy_io_handler();
+    let server = Server::new(addr, &io).unwrap();
+    std::thread::spawn(move || {
+        server.run()
+    });
+
+    for i in 0..100 {
+        let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [42,"#.to_owned() + &format!("{}", i) + r#"], "id": 1}"#;
+        let response = r#"{"jsonrpc":"2.0","result":"hello 42! you sent "#.to_owned() + &format!("{}", i)  + r#"","id":1}"#;
+        assert_eq!(String::from_utf8(dummy_request(addr, request.as_bytes())).unwrap(), response.to_string());
+    }
+}
+
 #[test]
 pub fn test_reqrep_poll() {
-    let addr = "/tmp/test20";
+    let addr = "/tmp/test40";
     let io = dummy_io_handler();
     let server = Server::new(addr, &io).unwrap();
     std::thread::spawn(move || {
@@ -318,8 +403,24 @@ pub fn test_reqrep_poll() {
     });
 
     let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [42, 23], "id": 1}"#;
-    let response = r#"{"jsonrpc":"2.0","result":"hello","id":1}"#;
+    let response = r#"{"jsonrpc":"2.0","result":"hello 42! you sent 23","id":1}"#;
     assert_eq!(String::from_utf8(dummy_request(addr, request.as_bytes())).unwrap(), response.to_string());
 
     std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+#[test]
+pub fn test_file_removed() {
+    let addr = "/tmp/test50";
+    let io = dummy_io_handler();
+    {
+        let server = Server::new(addr, &io).unwrap();
+        server.run_async().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let request = r#"{"jsonrpc": "2.0", "method": "say_hello", "params": [42, 23], "id": 1}"#;
+        let response = r#"{"jsonrpc":"2.0","result":"hello 42! you sent 23","id":1}"#;
+        assert_eq!(String::from_utf8(dummy_request(addr, request.as_bytes())).unwrap(), response.to_string());
+    }
+    assert!(::std::fs::metadata(addr).is_err()); // err is file not exists
 }
