@@ -42,7 +42,7 @@
 
 use mio::*;
 use mio::unix::*;
-use bytes::{Buf, ByteBuf, MutByteBuf};
+use bytes::{ByteBuf, MutByteBuf};
 use std::io;
 use jsonrpc_core::IoHandler;
 use std::sync::*;
