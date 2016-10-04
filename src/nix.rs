@@ -60,7 +60,7 @@ const MAX_WRITE_LENGTH: usize = 8192;
 
 struct SocketConnection {
     socket: UnixStream,
-    buf: Option<ByteBuf>,
+    write_buf: Option<Vec<u8>>,
     mut_buf: Option<MutByteBuf>,
     token: Option<Token>,
     interest: EventSet,
@@ -72,7 +72,7 @@ impl SocketConnection {
     fn new(sock: UnixStream) -> Self {
         SocketConnection {
             socket: sock,
-            buf: None,
+            write_buf: None,
             mut_buf: Some(ByteBuf::mut_with_capacity(4096)),
             token: None,
             interest: EventSet::hup(),
@@ -81,15 +81,15 @@ impl SocketConnection {
 
     fn writable(&mut self, event_loop: &mut EventLoop<RpcServer>, _handler: &IoHandler) -> io::Result<()> {
         use std::io::Write;
-        if let Some(buf) = self.buf.take() {
-			if buf.remaining() < MAX_WRITE_LENGTH {
-	            try!(self.socket.write_all(&buf.bytes()));
+        if let Some(buf) = self.write_buf.take() {
+			if buf.len() < MAX_WRITE_LENGTH {
+	            try!(self.socket.write_all(&buf[..]));
 				self.interest.remove(EventSet::writable());
 				self.interest.insert(EventSet::readable());
 			}
 			else {
-				try!(self.socket.write_all(&buf.bytes()[0..MAX_WRITE_LENGTH]));
-				self.buf = Some(ByteBuf::from_slice(&buf.bytes()[MAX_WRITE_LENGTH..]));
+				try!(self.socket.write_all(&buf[0..MAX_WRITE_LENGTH]));
+				self.write_buf = Some(buf[MAX_WRITE_LENGTH..].to_vec());
 			}
         }
 
@@ -117,7 +117,7 @@ impl SocketConnection {
                             response_bytes.extend(response_str.into_bytes());
                         }
                     }
-                    self.buf = Some(ByteBuf::from_slice(&response_bytes[..]));
+                    self.write_buf = Some(response_bytes[..].to_vec());
 
                     let mut new_buf = ByteBuf::mut_with_capacity(4096);
                     new_buf.write_slice(&buf.bytes()[last_index+1..]);
