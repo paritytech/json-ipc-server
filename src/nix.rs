@@ -40,19 +40,21 @@
 //! }
 //! ```
 
-use mio::*;
-use mio::unix::*;
-use bytes::{Buf, ByteBuf, MutByteBuf};
-use std::io;
-use jsonrpc_core::IoHandler;
+use std;
+use std::io::{self, Write};
+use std::collections::VecDeque;
 use std::sync::*;
 use std::sync::atomic::*;
-use std;
+
+use bytes::{Bytes, Buf, ByteStr, ByteBuf, MutByteBuf};
+use jsonrpc_core::{IoHandler, IoSession, IoSessionHandler};
+use mio::*;
+use mio::unix::*;
+
 use slab;
 use validator;
 #[cfg(test)]
 use tests;
-use std::collections::VecDeque;
 
 const SERVER: Token = Token(0);
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
@@ -60,8 +62,9 @@ const MAX_WRITE_LENGTH: usize = 8192;
 
 struct SocketConnection {
 	socket: UnixStream,
-	buf: Option<ByteBuf>,
-	mut_buf: Option<MutByteBuf>,
+	session: IoSession,
+	write_buffer: Option<ByteBuf>,
+	read_buffer: Option<MutByteBuf>,
 	token: Option<Token>,
 	interest: EventSet,
 }
@@ -69,63 +72,82 @@ struct SocketConnection {
 type Slab<T> = slab::Slab<T, Token>;
 
 impl SocketConnection {
-	fn new(sock: UnixStream) -> Self {
+	fn new(sock: UnixStream, session: IoSession) -> Self {
 		SocketConnection {
 			socket: sock,
-			buf: None,
-			mut_buf: Some(ByteBuf::mut_with_capacity(4096)),
+			session: session,
 			token: None,
 			interest: EventSet::hup(),
+			write_buffer: None,
+			read_buffer: Some(ByteBuf::mut_with_capacity(4096)),
 		}
 	}
 
-	fn writable(&mut self, event_loop: &mut EventLoop<RpcServer>, _handler: &IoHandler) -> io::Result<()> {
-		use std::io::Write;
-		if let Some(buf) = self.buf.take() {
+	fn write(&mut self, event_loop: &mut EventLoop<RpcServer>, data: Bytes) -> io::Result<()> {
+		let bytes = {
+			if let Some(bytes) = self.write_buffer.take() {
+				let mut buf = bytes.resume();
+				buf.write_slice(data.buf().bytes());
+				buf.flip()
+			} else {
+				self.interest.insert(EventSet::writable());
+				ByteBuf::from_slice(data.buf().bytes())
+			}
+		};
+		self.write_buffer = Some(bytes);
+
+		event_loop.reregister(&self.socket, self.token.unwrap(), self.interest, PollOpt::edge() | PollOpt::oneshot())
+	}
+
+	fn writable(&mut self, event_loop: &mut EventLoop<RpcServer>) -> io::Result<()> {
+		if let Some(buf) = self.write_buffer.take() {
 			if buf.remaining() < MAX_WRITE_LENGTH {
 				try!(self.socket.write_all(&buf.bytes()));
 				self.interest.remove(EventSet::writable());
 				self.interest.insert(EventSet::readable());
 			} else {
 				try!(self.socket.write_all(&buf.bytes()[0..MAX_WRITE_LENGTH]));
-				self.buf = Some(ByteBuf::from_slice(&buf.bytes()[MAX_WRITE_LENGTH..]));
+				self.write_buffer = Some(ByteBuf::from_slice(&buf.bytes()[MAX_WRITE_LENGTH..]));
 			}
 		}
 
 		event_loop.reregister(&self.socket, self.token.unwrap(), self.interest, PollOpt::edge() | PollOpt::oneshot())
 	}
 
-	fn readable(&mut self, event_loop: &mut EventLoop<RpcServer>, handler: &IoHandler) -> io::Result<()> {
-		let mut buf = self.mut_buf.take().unwrap_or_else(|| panic!("unwrapping mutable buffer which is None"));
+	fn readable(&mut self, event_loop: &mut EventLoop<RpcServer>) -> io::Result<()> {
+		let mut buf = self.read_buffer.take().unwrap_or_else(|| panic!("unwrapping mutable buffer which is None"));
 
 		match self.socket.try_read_buf(&mut buf) {
 			Ok(None) => {
 				trace!(target: "ipc", "Empty read ({:?})", self.token);
-				self.mut_buf = Some(buf);
-				//return Ok(());
+				self.read_buffer = Some(buf);
 			}
 			Ok(Some(_)) => {
 				let (requests, last_index) = validator::extract_requests(buf.bytes());
-				if requests.len() > 0 {
-					let mut response_bytes = Vec::new();
+				if requests.is_empty() {
+					self.read_buffer = Some(buf);
+				} else {
 					for rpc_msg in requests {
 						trace!(target: "ipc", "Request: {}", rpc_msg);
-						let response: Option < String > = handler.handle_request_sync( &rpc_msg);
-						if let Some(response_str) = response {
-						trace!(target: "ipc", "Response: {}", &response_str);
-						response_bytes.extend(response_str.into_bytes());
-						}
+
+						let channel = event_loop.channel();
+						let token = self.token.unwrap();
+						self.session.handle_request(&rpc_msg, move |response: Option<String>| {
+							if let Some(response_str) = response {
+								trace!(target: "ipc", "Response: {}", &response_str);
+								if let Err(e) = channel.send(RpcMessage::Write(token, Bytes::from_slice(&response_str.into_bytes()))) {
+									warn!(target: "ipc", "Error waking up the event loop: {:?}", e);
+								}
+							}
+						});
 					}
-					self.buf = Some(ByteBuf::from_slice(&response_bytes[..]));
 
 					let mut new_buf = ByteBuf::mut_with_capacity(4096);
 					new_buf.write_slice(&buf.bytes()[last_index + 1..]);
-					self.mut_buf = Some(new_buf);
+					self.read_buffer = Some(new_buf);
 
 					self.interest.remove(EventSet::readable());
 					self.interest.insert(EventSet::writable());
-				} else {
-					self.mut_buf = Some(buf);
 				}
 			}
 			Err(e) => {
@@ -259,7 +281,7 @@ impl RpcServer {
 
 	fn accept(&mut self, event_loop: &mut EventLoop<RpcServer>) -> io::Result<()> {
 		let new_client_socket = self.socket.accept().unwrap().unwrap();
-		let connection = SocketConnection::new(new_client_socket);
+		let connection = SocketConnection::new(new_client_socket, self.io_handler.session());
 		if self.connections.count() >= MAX_CONCURRENT_CONNECTIONS {
 			// max connections
 			return Ok(());
@@ -271,23 +293,25 @@ impl RpcServer {
 
 		self.connections[token].token = Some(token);
 		event_loop.register(
-		& self.connections[token].socket,
-		token,
-		EventSet::readable(),
-		PollOpt::edge() | PollOpt::oneshot()
+			& self.connections[token].socket,
+			token,
+			EventSet::readable(),
+			PollOpt::edge() | PollOpt::oneshot()
 		).ok().expect("fatal: could not register socket with event loop (memory issue?)");
 
 		Ok(())
 	}
 
+	fn connection_write(&mut self, event_loop: &mut EventLoop<RpcServer>, tok: Token, data: Bytes) -> io::Result<()> {
+		self.connection(tok).write(event_loop, data)
+	}
+
 	fn connection_readable(&mut self, event_loop: &mut EventLoop<RpcServer>, tok: Token) -> io::Result<()> {
-		let io_handler = self.io_handler.clone();
-		self.connection(tok).readable(event_loop, &io_handler)
+		self.connection(tok).readable(event_loop)
 	}
 
 	fn connection_writable(&mut self, event_loop: &mut EventLoop<RpcServer>, tok: Token) -> io::Result<()> {
-		let io_handler = self.io_handler.clone();
-		self.connection(tok).writable(event_loop, &io_handler)
+		self.connection(tok).writable(event_loop)
 	}
 
 	fn connection<'a>(&'a mut self, tok: Token) -> &'a mut SocketConnection {
@@ -300,10 +324,20 @@ impl RpcServer {
 	}
 }
 
+enum RpcMessage {
+	Write(Token, Bytes),
+}
+
 
 impl Handler for RpcServer {
 	type Timeout = usize;
-	type Message = ();
+	type Message = RpcMessage;
+
+	fn notify(&mut self, event_loop: &mut EventLoop<RpcServer>, msg: RpcMessage) {
+		match msg {
+			RpcMessage::Write(token, bytes) => self.connection_write(event_loop, token, bytes).unwrap(),
+		}
+	}
 
 	fn ready(&mut self, event_loop: &mut EventLoop<RpcServer>, token: Token, events: EventSet) {
 		if events.is_readable() {
