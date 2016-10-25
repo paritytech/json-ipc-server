@@ -62,7 +62,7 @@ const REQUEST_CHUNK_SIZE: usize = 4096;
 struct SocketConnection {
 	socket: UnixStream,
 	write_buf: Option<Vec<u8>>,
-	mut_buf: Option<MutByteBuf>,
+	read_buf: MutByteBuf,
 	token: Option<Token>,
 	interest: EventSet,
 	request: Vec<u8>,
@@ -75,7 +75,7 @@ impl SocketConnection {
 		SocketConnection {
 			socket: sock,
 			write_buf: None,
-			mut_buf: Some(ByteBuf::mut_with_capacity(REQUEST_CHUNK_SIZE)),
+			read_buf: ByteBuf::mut_with_capacity(REQUEST_CHUNK_SIZE),
 			token: None,
 			interest: EventSet::hup(),
 			request: Vec::with_capacity(REQUEST_CHUNK_SIZE),
@@ -86,11 +86,10 @@ impl SocketConnection {
 		use std::io::Write;
 		if let Some(buf) = self.write_buf.take() {
 			if buf.len() < MAX_WRITE_LENGTH {
-	            try!(self.socket.write_all(&buf[..]));
+				try!(self.socket.write_all(&buf));
 				self.interest.remove(EventSet::writable());
 				self.interest.insert(EventSet::readable());
-			}
-			else {
+			} else {
 				try!(self.socket.write_all(&buf[0..MAX_WRITE_LENGTH]));
 				self.write_buf = Some(buf[MAX_WRITE_LENGTH..].to_vec());
 			}
@@ -100,15 +99,12 @@ impl SocketConnection {
 	}
 
 	fn readable(&mut self, event_loop: &mut EventLoop<RpcServer>, handler: &IoHandler) -> io::Result<()> {
-		let mut buf = self.mut_buf.take().unwrap_or_else(|| panic!("unwrapping mutable buffer which is None"));
-
-		match self.socket.try_read_buf(&mut buf) {
+		match self.socket.try_read_buf(&mut self.read_buf) {
 			Ok(None) => {
 				trace!(target: "ipc", "Empty read ({:?})", self.token);
-				self.mut_buf = Some(buf);
 			}
 			Ok(Some(_)) => {
-				self.request.extend(buf.bytes());
+				self.request.extend(self.read_buf.bytes());
 				let (requests, last_index) = validator::extract_requests(&self.request);
 				if requests.len() > 0 {
 					let mut response_bytes = Vec::new();
@@ -120,9 +116,9 @@ impl SocketConnection {
 							response_bytes.extend(response_str.into_bytes());
 						}
 					}
-					self.write_buf = Some(response_bytes[..].to_vec());
+					self.write_buf = Some(response_bytes);
 
-					let left_over = self.request.drain(last_index..).collect::<Vec<u8>>();
+					let left_over = self.request.drain(last_index + 1..).collect::<Vec<u8>>();
 					self.request = Vec::with_capacity(REQUEST_CHUNK_SIZE);
 					self.request.extend(&left_over);
 
@@ -133,7 +129,7 @@ impl SocketConnection {
 					self.interest.insert(EventSet::readable());
 					trace!(target: "ipc", "Incomplete request: {}", String::from_utf8(self.request.clone()).unwrap_or("<non-utf>".to_owned()));
 				}
-				self.mut_buf = Some(ByteBuf::mut_with_capacity(REQUEST_CHUNK_SIZE));
+				self.read_buf.clear();
 			}
 			Err(e) => {
 				trace!(target: "ipc", "Error receiving data ({:?}): {:?}", self.token, e);
