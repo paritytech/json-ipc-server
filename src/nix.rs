@@ -57,6 +57,7 @@ use std::collections::VecDeque;
 const SERVER: Token = Token(0);
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 const MAX_WRITE_LENGTH: usize = 8192;
+const REQUEST_CHUNK_SIZE: usize = 4096;
 
 struct SocketConnection {
 	socket: UnixStream,
@@ -64,6 +65,7 @@ struct SocketConnection {
 	mut_buf: Option<MutByteBuf>,
 	token: Option<Token>,
 	interest: EventSet,
+	request: Vec<u8>,
 }
 
 type Slab<T> = slab::Slab<T, Token>;
@@ -73,9 +75,10 @@ impl SocketConnection {
 		SocketConnection {
 			socket: sock,
 			write_buf: None,
-			mut_buf: Some(ByteBuf::mut_with_capacity(4096)),
+			mut_buf: Some(ByteBuf::mut_with_capacity(REQUEST_CHUNK_SIZE)),
 			token: None,
 			interest: EventSet::hup(),
+			request: Vec::with_capacity(REQUEST_CHUNK_SIZE),
 		}
 	}
 
@@ -102,11 +105,11 @@ impl SocketConnection {
 		match self.socket.try_read_buf(&mut buf) {
 			Ok(None) => {
 				trace!(target: "ipc", "Empty read ({:?})", self.token);
-                self.mut_buf = Some(buf);
-				//return Ok(());
+				self.mut_buf = Some(buf);
 			}
 			Ok(Some(_)) => {
-				let (requests, last_index) = validator::extract_requests(buf.bytes());
+				self.request.extend(buf.bytes());
+				let (requests, last_index) = validator::extract_requests(&self.request);
 				if requests.len() > 0 {
 					let mut response_bytes = Vec::new();
 					for rpc_msg in requests {
@@ -119,16 +122,18 @@ impl SocketConnection {
 					}
 					self.write_buf = Some(response_bytes[..].to_vec());
 
-					let mut new_buf = ByteBuf::mut_with_capacity(4096);
-					new_buf.write_slice(&buf.bytes()[last_index+1..]);
-					self.mut_buf = Some(new_buf);
+					let left_over = self.request.drain(last_index..).collect::<Vec<u8>>();
+					self.request = Vec::with_capacity(REQUEST_CHUNK_SIZE);
+					self.request.extend(&left_over);
 
 					self.interest.remove(EventSet::readable());
 					self.interest.insert(EventSet::writable());
 				}
 				else {
-					self.mut_buf = Some(buf);
+					self.interest.insert(EventSet::readable());
+					trace!(target: "ipc", "Incomplete request: {}", String::from_utf8(self.request.clone()).unwrap_or("<non-utf>".to_owned()));
 				}
+				self.mut_buf = Some(ByteBuf::mut_with_capacity(REQUEST_CHUNK_SIZE));
 			}
 			Err(e) => {
 				trace!(target: "ipc", "Error receiving data ({:?}): {:?}", self.token, e);
